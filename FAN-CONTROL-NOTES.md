@@ -61,9 +61,87 @@ worth keeping:
 `thermal_zone_bind_cooling_device()` rejects a map with
 `upper > cdev->max_state` (returns `-EINVAL`). With the original five
 `cooling-levels`, `max_state` was 4, so map4 through map7
-(`<&fan0 4 5>` .. `<&fan0 7 8>`) all failed to bind and the fan could not
-respond above 65 C. Extending the ladder to nine levels fixed real breakage.
-The commit message stands as written.
+(`<&fan0 4 5>` .. `<&fan0 7 8>`) all failed to bind. Extending the ladder to
+nine levels fixed real breakage, and the `max_state` reasoning in the commit
+message is correct.
+
+One clause in it is not, though: it says the failed binds left "the fan unable
+to respond at the temperatures that need it". They did not. State 4 in the old
+five-level table was duty 255, so the fan was already at 100% from 60 C upward
+and the unbound maps cost nothing thermally. What they cost was every
+intermediate speed — the fan had no way to be anything but off, three coarse
+steps, or full blast. Reword that clause if the commit is ever sent upstream.
+See the behaviour tables below.
+
+## Fan behaviour, before and after
+
+Rock 5B under step_wise. "Before" is `rk-6.1-rkr5.1`, "after" is the tip of this
+branch. Not measured on hardware — derived from the DT and the governor code.
+
+### Duty vs. temperature (rising)
+
+| SoC temp | Before: state -> duty | Before % | After: state -> duty | After % |
+|---|---|---|---|---|
+| < 45 C | 0 -> 0 | off | 0 -> 0 | off |
+| 45-50 C | 1 -> 64 | 25% | 1 -> 128 | 50% |
+| 50-55 C | 2 -> 128 | 50% | 2 -> 146 | 57% |
+| 55-60 C | 3 -> 192 | 75% | 3 -> 164 | 64% |
+| 60-65 C | **4 -> 255** | **100%** | 4 -> 182 | 71% |
+| 65-70 C | 4 -> 255 *(map unbound)* | 100% | 5 -> 201 | 79% |
+| 70-75 C | 4 -> 255 *(map unbound)* | 100% | 6 -> 219 | 86% |
+| 75-80 C | 4 -> 255 *(map unbound)* | 100% | 7 -> 237 | 93% |
+| >= 80 C | 4 -> 255 *(map unbound)* | 100% | 8 -> 255 | 100% |
+
+The old `cooling-levels = <0 64 128 192 255>` gave `max_state = 4`, so the four
+maps requesting states 5-8 (`<&fan0 4 5>` .. `<&fan0 7 8>`) were rejected by
+`thermal_zone_bind_cooling_device()` with `-EINVAL`. Visible on an unpatched
+kernel:
+
+```sh
+dmesg | grep "Failed to bind"    # 4 x soc-thermal with pwm-fan: -22
+```
+
+Note what the defect actually was: the fan was **not** under-cooling. It slammed
+to 100% at 60 C and stayed there, so the unbound maps made no thermal
+difference — there was nothing above full speed to reach. The problem was noise,
+not temperature. The old commit message for `dd3ccc4ac62a` describes it as the
+fan being "unable to respond", which is not right; reword if that commit is ever
+sent upstream.
+
+### Falling behaviour — this is what the hysteresis fix changes
+
+| | Before | After |
+|---|---|---|
+| Steps down at | the same temperature it stepped up at | 5 C below the trip that set it |
+| duty 182 (entered at 60 C) | n/a, was already at 255 | holds until < 55 C |
+| duty 164 (entered at 55 C) | dropped as soon as temp < 55 C | holds until < 50 C |
+| At a boundary with sensor noise | flips one level per poll (1 s), audible hunting | stable, single step |
+
+`gov_step_wise.c` computed `throttle` as a bare `tz->temperature >= trip_temp`
+and never called `get_trip_hyst()`, so `hysteresis = <5000>` was inert and the
+up-threshold and down-threshold were the same number. The 5 C trip spacing was
+never the problem: a trip now disengages exactly where the one below it engages,
+giving a clean monotone ladder.
+
+### Everything else
+
+| Behaviour | Before | After | Commit |
+|---|---|---|---|
+| PWM carrier | 16.667 kHz, audible whine at every intermediate duty (64/128/192) | 40 kHz, inaudible | `2b96fa19ff6c` |
+| Whine at 0% / 100% | none (no switching either way) | none | - |
+| First spin-up step | 64 (25%), below reliable start for many 2-wire fans; can stall and buzz | 128 (50%), starts cleanly | `dd3ccc4ac62a` |
+| Usable speed steps | 4 (of 8 maps) | 8 | `dd3ccc4ac62a` |
+| Ramp 60 -> 80 C | flat at 100% | 71 -> 79 -> 86 -> 93 -> 100% | `dd3ccc4ac62a` |
+
+Net: it used to be silent below 45 C, whine through three coarse steps, hit full
+blast at 60 C, and hunt between levels whenever the temperature sat near a trip.
+It should now ramp in eight inaudible steps across 45-80 C and hold each one
+until the SoC has genuinely cooled 5 C.
+
+Not shown in the tables, and the thing to watch: the step_wise change also
+affects CPU and GPU throttling on this board, since they share `soc_thermal` and
+the base dtsi passive trips use `hysteresis = <2000>`. Those cooling states now
+hold about 2 C longer too.
 
 ## What was verified, and how
 
