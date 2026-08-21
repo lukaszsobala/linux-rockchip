@@ -3,6 +3,12 @@
 Scratch notes for the `rock-5b-fan-pwm-frequency` branch. Not for upstream
 submission as-is. Delete before sending patches.
 
+Target: Armbian **rk35xx / vendor** — `armbian/linux-rockchip` at
+`rk-6.1-rkr5.1`, built with `config/kernel/linux-rk35xx-vendor.config` and
+patched from `patch/kernel/rk35xx-vendor-6.1/`. Everything below is about that
+tree. The `current` and `edge` branches are a different kernel entirely
+(`LINUXFAMILY=rockchip64`, mainline 6.18 / 7.1) — see "Scope: vendor only".
+
 ## Status
 
 | Area | State |
@@ -11,34 +17,60 @@ submission as-is. Delete before sending patches.
 | Nine-level cooling ladder on 5B | **Done**, committed — confirmed correct, see below |
 | Hysteresis was dead code | **Done**, committed — `gov_step_wise.c` |
 | pwm-fan vendor path had no hysteresis | **Done**, committed — affects other boards |
-| power_allocator trip discovery | **Done**, committed — robustness only |
+| Verification against Armbian's build | **Done** — see that section |
+| Real kernel build / boot test | **Not started** — now unblocked, see "Open questions" |
 | Other affected boards | **Not started** — see "Remaining boards" |
 
-## IMPORTANT: earlier power_allocator analysis was wrong for this board
+## The governor is step_wise — confirmed, with the mechanism
 
-An earlier pass concluded that `soc_thermal` runs **power_allocator**, that the
-cooling-maps were therefore inert, and that the fan had to be moved onto
-`rockchip,temp-trips`. That conversion was written, committed, and then
-**reverted** — see the revert commit on this branch.
+The Rock 5B on the Armbian vendor kernel runs **step_wise**. Confirmed on the
+target and traced back through Armbian's build to the reason why:
 
-The premise was false. The real Rock 5B runs **step_wise**, not
-power_allocator. The earlier conclusion came from
-`arch/arm64/configs/rockchip_linux_defconfig:283`
-(`CONFIG_THERMAL_DEFAULT_GOV_POWER_ALLOCATOR=y`), but this repo's defconfig is
-not what the running image is built with. Confirm the governor on the target,
-never from the defconfig:
+- `config/kernel/linux-rk35xx-vendor.config` contains **no**
+  `CONFIG_THERMAL_DEFAULT_GOV_*` line at all, and no
+  `CONFIG_THERMAL_GOV_STEP_WISE` line either.
+- `drivers/thermal/Kconfig` declares the choice `default
+  THERMAL_DEFAULT_GOV_STEP_WISE`, and that symbol `select`s
+  `THERMAL_GOV_STEP_WISE`.
+- So `olddefconfig` fills in step_wise, which pulls the governor in. The built
+  image agrees: `/boot/config-6.1.115-vendor-rk35xx` has
+  `CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE=y` and `CONFIG_THERMAL_GOV_STEP_WISE=y`.
+
+Under step_wise the cooling-map route works correctly, so the DT stays as it
+was and the fan fix is in the governor plus two DT value corrections.
+
+**Do not reason from `arch/arm64/configs/rockchip_linux_defconfig`.** Armbian
+never uses it. An earlier pass on this branch read line 283 of that file,
+concluded the board used a different governor, decided the cooling-maps were
+inert, and converted the fan to `rockchip,temp-trips`. That work was committed
+and then **reverted** (see the revert commit on this branch). The premise was
+false and it cost a full round trip. Always confirm on the target:
 
 ```sh
 cat /sys/class/thermal/thermal_zone0/policy       # soc-thermal: step_wise here
 cat /sys/class/thermal/thermal_zone0/available_policies
 ```
 
-Under step_wise the cooling-map route works correctly, so the DT stays as it
-was and the fix is entirely in the governor. Keep this in mind before acting on
-any defconfig-derived reasoning in this tree.
+This generalises: every Armbian rk35xx-vendor board shares that one config
+file, so **they are all step_wise**. No per-board governor check is needed
+within this family.
 
-The parts of that analysis that remain true regardless of governor, and are
-worth keeping:
+One fragility to keep in mind: it is step_wise *by omission*, not by intent.
+Anyone adding an explicit `CONFIG_THERMAL_DEFAULT_GOV_*` to
+`linux-rk35xx-vendor.config` — or a `savedefconfig` round-trip that imports one
+from `rockchip_linux_defconfig` — silently flips the premise and re-breaks the
+fan. Worth a comment in that config if these patches are upstreamed to Armbian.
+
+### Why cooling-maps, not `rockchip,temp-trips`
+
+The reverted conversion is not worth redoing. Under step_wise the cooling-maps
+work, they honour the DT `hysteresis` property, they are tunable without a
+driver change, and they are upstreamable — none of which is true of the
+Rockchip-specific `rockchip,temp-trips` bypass. That bypass also *replaces*
+rather than complements the cooling-map route: `pwm_fan_probe()` takes it first
+and returns before registering the cooling device.
+
+The findings from that pass that remain true and are worth keeping:
 
 - The board's trip nodes are named `trip-point@N`, the base dtsi's are
   `trip-point-N`. Different names, so they **merge** rather than override.
@@ -46,32 +78,9 @@ worth keeping:
   `[1]` 85 C passive, `[2]` 115 C critical, `[3..10]` the eight board active
   trips. `thermal_of.c` does not sort them. Harmless under step_wise, which
   processes every trip index independently.
-- `thermal_of.c` never parses a governor property, so the governor cannot be
-  selected from DT in this tree — only by kconfig default or by writing
-  `/sys/class/thermal/thermal_zone0/policy`.
-- `get_governor_trips()` in `gov_power_allocator.c` stopped trip discovery at
-  the first hot/critical trip. Real order-dependence bug, fixed on this branch,
-  but it does not affect these boards.
-- `pwm_fan_cooling_ops` implements none of the power-actor ops, so a fan can
-  never be actuated by power_allocator. Relevant to any board that *does*
-  default to that governor.
-
-### Why commit "list all nine fan cooling levels" was right
-
-`thermal_zone_bind_cooling_device()` rejects a map with
-`upper > cdev->max_state` (returns `-EINVAL`). With the original five
-`cooling-levels`, `max_state` was 4, so map4 through map7
-(`<&fan0 4 5>` .. `<&fan0 7 8>`) all failed to bind. Extending the ladder to
-nine levels fixed real breakage, and the `max_state` reasoning in the commit
-message is correct.
-
-One clause in it is not, though: it says the failed binds left "the fan unable
-to respond at the temperatures that need it". They did not. State 4 in the old
-five-level table was duty 255, so the fan was already at 100% from 60 C upward
-and the unbound maps cost nothing thermally. What they cost was every
-intermediate speed — the fan had no way to be anything but off, three coarse
-steps, or full blast. Reword that clause if the commit is ever sent upstream.
-See the behaviour tables below.
+- `thermal_of.c` never parses a governor property (verified: no match in the
+  file), so the governor cannot be selected from DT in this tree — only by
+  kconfig default or by writing `/sys/class/thermal/thermal_zone0/policy`.
 
 ## Fan behaviour, before and after
 
@@ -104,8 +113,8 @@ dmesg | grep "Failed to bind"    # 4 x soc-thermal with pwm-fan: -22
 Note what the defect actually was: the fan was **not** under-cooling. It slammed
 to 100% at 60 C and stayed there, so the unbound maps made no thermal
 difference — there was nothing above full speed to reach. The problem was noise,
-not temperature. The old commit message for `dd3ccc4ac62a` describes it as the
-fan being "unable to respond", which is not right; reword if that commit is ever
+not temperature. The commit message for `dd3ccc4ac62a` describes it as the fan
+being "unable to respond", which is not right; reword if that commit is ever
 sent upstream.
 
 ### Falling behaviour — this is what the hysteresis fix changes
@@ -149,8 +158,9 @@ hold about 2 C longer too.
 
 `gov_step_wise.c` computed `throttle` as a bare `tz->temperature >= trip_temp`
 and never called `get_trip_hyst`. The `hysteresis` DT property fed only
-`__thermal_zone_set_trips()` (an IRQ window that `rockchip_thermal.c:2202`
-discards — it programs `high` only, ignoring `low`) and netlink notifications.
+`__thermal_zone_set_trips()` (an IRQ window that `rockchip_thermal.c` discards —
+`rockchip_thermal_set_trips()` accepts `low` and `high` but passes only `high`
+to `set_alarm_temp`, verified) and netlink notifications.
 
 Note: 5 C hysteresis on 5 C trip spacing is *fine* once hysteresis works. Trip N
 disengages exactly where trip N-1 engages — a clean monotone ladder, no chatter,
@@ -163,40 +173,141 @@ trip is inside its band and stays engaged, holding state 4. Only below 55 C does
 it drop to 3, where the 55 C trip's band holds it. Monotone the whole way down.
 Without the fix each boundary chatters instead.
 
-**This is now the primary fix for the Rock 5B**, not a side improvement.
+**This is the primary fix for the Rock 5B**, not a side improvement.
+
+### Mainline implements the same semantic — so this is a backport, not a submission
+
+Checked against the cached mainline tree
+(`build/cache/sources/linux-kernel-worktree/7.2__rockchip64__arm64`):
+
+```
+vendor 6.1     if (tz->temperature >= trip_temp)                 /* raw trip temp */
+mainline 7.2   bool throttle = tz->temperature >= trip_threshold;
+```
+
+where mainline's `trip_threshold` is `td->threshold`, maintained in
+`thermal_core.c`: `td->threshold = td->trip.temperature` when the trip is not
+reached, and `td->trip.temperature - td->trip.hysteresis` once it is.
+`struct thermal_trip_desc` carries the `int threshold` field for exactly this.
+
+That is the same behaviour this branch implements — rise at the trip, fall one
+hysteresis band below — placed in the core rather than the governor. Two
+consequences:
+
+1. The design is **validated**: mainline converged on the same semantic
+   independently.
+2. It is **not upstreamable to mainline**, which already has it. This is a
+   vendor-6.1 backport. Say so in the commit message or a reviewer will bounce
+   it as already-fixed.
+
+### Why commit "list all nine fan cooling levels" was right
+
+`thermal_zone_bind_cooling_device()` rejects a map with
+`upper > cdev->max_state` (returns `-EINVAL`). With the original five
+`cooling-levels`, `max_state` was 4, so map4 through map7
+(`<&fan0 4 5>` .. `<&fan0 7 8>`) all failed to bind. Extending the ladder to
+nine levels fixed real breakage, and the `max_state` reasoning in the commit
+message is correct — only the "unable to respond" clause is wrong, see above.
+
+## Verification against Armbian's build
+
+Done against `../build` (armbian/build). Board mapping:
+`config/boards/rock-5b.conf` -> `BOARDFAMILY=rockchip-rk3588`,
+`KERNEL_TARGET="current,edge,vendor"`; the `vendor` case in
+`config/sources/families/rockchip-rk3588.conf` gives
+`KERNELBRANCH=rk-6.1-rkr5.1`, `KERNELPATCHDIR=rk35xx-vendor-6.1`,
+`LINUXFAMILY=rk35xx`.
+
+**No conflict with Armbian patching:**
+
+- `patch/kernel/rk35xx-vendor-6.1/` holds exactly three patches — `001-hid-sony.patch`
+  and two bluetooth ones — touching `drivers/bluetooth/hci_ldisc.c`,
+  `drivers/hid/hid-sony.c`, `include/net/bluetooth/hci.h`,
+  `net/bluetooth/hci_sync.c`. Zero overlap with anything on this branch.
+- Its `0000.patching_config.yaml` declares `dts-directories: dt ->
+  arch/arm64/boot/dts/rockchip`, but that patch dir has **no `dt/`
+  subdirectory**, so no board DTS is copied over ours. (Only
+  `rv1126-vendor-6.1` and `genio-1200-vendor` have one.)
+- Decisive: every file this branch touches is **byte-identical** between
+  pristine `upstream/rk-6.1-rkr5.1` and Armbian's real patched build tree at
+  `cache/sources/linux-kernel-worktree/6.1__rk35xx__arm64` — the three board
+  DTS, `gov_step_wise.c` and `pwm-fan.c`. `thermal_core.c` and
+  `gov_power_allocator.c` were compared too, as cross-checks; also identical.
+
+**Kernel config facts that matter:**
+
+- `CONFIG_ROCKCHIP_SYSTEM_MONITOR=y` — so the `rockchip,temp-trips` path is
+  live, and the `pwm-fan.c` hysteresis patch is not dead code on the boards
+  that use it.
+- `CONFIG_PWM_ROCKCHIP_ONESHOT` is **not** set, so `dclk_div = 1` in
+  `rockchip_pwm_config_v1()`. This is what the 40 kHz duty arithmetic assumed.
+- `CONFIG_SENSORS_PWM_FAN=m`, `CONFIG_PWM_ROCKCHIP=y`, `CONFIG_ROCKCHIP_THERMAL=y`.
+
+**Board sweep re-derived** by parsing inside each `pwm-fan` node (not the first
+`pwms` line in each file — that catches backlights and gives wrong answers):
+
+| nodes | period | carrier |
+|---|---|---|
+| 1 | 5000 ns | 200 kHz |
+| 11 | 10000 ns | 100 kHz |
+| 3 | 25000 ns | 40 kHz — the three boards fixed on this branch |
+| 7 | 40000 ns | 25 kHz |
+| 43 | 50000 ns | 20 kHz |
+| 3 | 60000 ns | **16.667 kHz** |
+| 2 | 250000 ns | **4 kHz** |
+| 2 | 20000000 ns | **50 Hz** |
+
+All three patched DTBs compile (`cpp` + `dtc`, exit 0). 5B+ and 5T correctly
+keep their five-level ladder — they use `THERMAL_NO_LIMIT` in their maps, so
+they never had the bind failure.
+
+## Scope: vendor only
+
+Rock 5B declares `KERNEL_TARGET="current,edge,vendor"`. `current` (6.18) and
+`edge` (7.1) resolve through `rockchip64_common.inc` to `LINUXFAMILY=rockchip64`
+— the mainline kernel, a different source tree. There the fan node lives in
+`rk3588-rock-5b-5bp-5t.dtsi`, shared across 5B/5B+/5T:
+
+```dts
+cooling-levels = <0 120 150 180 210 240 255>;   /* 7 levels, no bind bug */
+fan-supply = <&vcc5v0_sys>;                     /* regulator; absent in vendor */
+pwms = <&pwm1 0 50000 0>;                       /* 20 kHz, not 16.667 */
+```
+
+with only two fan trips (55 C and 65 C, `hysteresis = <2000>`). So **none of the
+three fixes apply to current/edge**: no whine bug, no bind bug, and hysteresis
+already handled in the core. The DT work does not follow you if you switch
+branch. Whether 20 kHz is quiet enough on the mainline branch is untested.
 
 ## How to confirm on hardware
 
 ```sh
-cat /sys/class/thermal/thermal_zone0/policy          # predicted: power_allocator
+cat /sys/class/thermal/thermal_zone0/policy          # expect: step_wise
 cat /sys/class/thermal/thermal_zone0/type            # soc-thermal
 grep . /sys/class/thermal/cooling_device*/type
-grep . /sys/class/thermal/cooling_device*/cur_state  # fan pinned at max?
-cat /sys/class/hwmon/hwmon*/pwm1                     # expect 255 pre-fix
+grep . /sys/class/thermal/cooling_device*/cur_state
+cat /sys/class/hwmon/hwmon*/pwm1
+dmesg | grep "Failed to bind"                        # pre-fix: 4 x -22
 ```
-Then load the SoC and watch whether `pwm1` moves.
+
+Then load the SoC and watch whether `pwm1` tracks the ladder in the table above,
+and whether each step holds until the temperature has fallen a full 5 C.
+
+Note: if `policy` reads `user_space`, something set it by hand — it is not the
+boot default. Set it back with
+`echo step_wise | sudo tee /sys/class/thermal/thermal_zone0/policy` before
+testing, or nothing in the cooling-map path will run at all.
 
 ## Changes on this branch
 
-All committed. Nothing is pushed upstream, so any of it can still be reworded,
-split, or dropped.
+All committed. Nothing is pushed, so any of it can still be reworded, split, or
+dropped.
 
-### DT — unchanged from mainline behaviour, deliberately
+### DT
 
-The `rockchip,temp-trips` conversion was reverted (see the IMPORTANT section
-above). The three board DTs now differ from their base only by the PWM period
-fix and the nine-level ladder. **The cooling-maps are the right mechanism here**:
-under step_wise they work, they honour the DT `hysteresis` property, they are
-tunable without a driver change, and they are upstreamable, none of which is
-true of the Rockchip-specific `rockchip,temp-trips` bypass.
-
-For reference if the governor question ever comes back: `rockchip,temp-trips`
-works because `rockchip-system-monitor` is bound to `soc-thermal`
-(`rk3588s.dtsi:2200`) and polls `thermal_zone_get_temp()` every 200 ms
-(`THERMAL_POLLING_DELAY`), notifying `pwm_fan_thermal_notifier_call()`
-independently of any governor. It takes priority in `pwm_fan_probe()`, which
-returns before registering the cooling device — so adding it *disables* the
-cooling-map route rather than complementing it.
+The three board DTs differ from their base only by the PWM period fix and, on
+the 5B, the nine-level ladder. The `rockchip,temp-trips` conversion was
+committed and reverted; see the revert commit.
 
 ### Drivers
 
@@ -205,7 +316,7 @@ cooling-map route rather than complementing it.
   that keeps throttling while the temperature sits inside
   `(trip_temp - hyst, trip_temp)` and the trip is already engaged. The rising
   edge still fires at the exact trip temperature; only the step back down is
-  delayed.
+  delayed. Matches mainline's semantic — see the backport note above.
   - **Blast radius: every thermal zone on every platform using step_wise**,
     including CPU/GPU throttling on these very boards, since they share
     `soc_thermal` with the fan. Cooling states now hold about one hysteresis
@@ -224,51 +335,55 @@ cooling-map route rather than complementing it.
     already suppresses falling-temperature notifications until the drop exceeds
     2000 mC from `last_temp`. The two compose, giving an effective falling
     deadband of roughly 2-4 C. Tune `PWM_FAN_TEMP_HYST` with that in mind.
-- `drivers/thermal/gov_power_allocator.c` — `get_governor_trips()` no longer
-  `break`s on a hot/critical trip, so trips described after one are still seen.
-  Genuine order-dependence bug, but **changes nothing on these boards** since
-  they do not use this governor. Pure robustness; safe to split out or drop.
+- `drivers/thermal/gov_power_allocator.c` — **dropped from this series.** It
+  was an unrelated robustness fix carried along from the reverted pass:
+  `get_governor_trips()` no longer `break`s on a hot/critical trip, so trips
+  described after one are still seen. A real order-dependence bug, but it
+  changes nothing on these boards and does not belong here. Resurrect it as its
+  own patch from the reflog if it is ever wanted.
 
 ### Verification done
 
-- All three DTBs compile (`cpp` + `dtc`, exit 0) and were confirmed byte-identical
+- All three DTBs compile (`cpp` + `dtc`, exit 0) and were confirmed identical
   to their post-PWM-fix state after the revert.
 - All three .c files pass `gcc -fsyntax-only -std=gnu11` with kernel include
   flags, exit 0.
-- **No real kernel build, no boot, no hardware measurement.** No aarch64
-  cross-compiler was available and objtool needs libelf, which was not
-  installed. Syntax and type checking only.
+- Cross-checked against Armbian's build — see that section.
+- **No real kernel build, no boot, no hardware measurement.** See below: this is
+  now unblocked.
 
 ## Open questions
 
-1. **Does the step_wise change actually settle the fan?** This is the one to
-   test first. Load the SoC, sweep the temperature across 60 C and 65 C, and
-   watch `/sys/class/hwmon/hwmon*/pwm1` for hunting. Expect the state to hold
-   until the temperature falls a full 5 C below the trip that set it.
-2. **Watch CPU/GPU throttling for regressions** from the same change — see the
+1. **Build and boot it.** This is the next step and it is no longer blocked.
+   The earlier note that no aarch64 cross-compiler was available was wrong —
+   this host *is* aarch64 (`gcc -dumpmachine` -> `aarch64-linux-gnu`), so no
+   cross-compiler is needed at all, and `libelf-dev`, `libssl-dev`, `bison`,
+   `flex` and `bc` are all installed. A native build is possible now.
+2. **Does the step_wise change actually settle the fan?** Load the SoC, sweep
+   across 60 C and 65 C, watch `/sys/class/hwmon/hwmon*/pwm1` for hunting.
+   Expect each state to hold until the temperature falls a full 5 C below the
+   trip that set it.
+3. **Watch CPU/GPU throttling for regressions** from the same change — see the
    blast-radius note above. If it causes trouble, the alternative is to scope
    the hysteresis to active trips only, or to make it opt-in per zone.
-3. **The pwm-fan hysteresis value (2000 mC) is a guess** and cannot be validated
+4. **The pwm-fan hysteresis value (2000 mC) is a guess** and cannot be validated
    on a Rock 5B. Test on a board that uses `rockchip,temp-trips` — Rock 5A is
    the easiest.
-4. **Verify the governor on every target before assuming**, with
-   `cat /sys/class/thermal/thermal_zone0/policy`. Do not trust
-   `rockchip_linux_defconfig` — that mistake cost a full round trip on this
-   branch. Boards that *do* default to power_allocator cannot drive a pwm-fan
-   from cooling-maps at all, and would need either `rockchip,temp-trips` or
-   power-actor ops added to pwm-fan.
-5. **Rejected for now:** forcing `policy=step_wise` via udev (userspace, not a
+5. **The idle fan-off floor.** `cooling-levels[0] = 0` stops the fan below 45 C
+   and restarts it at 45 C, dropping out again at 40 C. A board idling in the
+   38-47 C range will cycle audibly. This is inherited stock behaviour, not
+   something the branch introduced, but a non-zero floor is probably better in
+   practice. Deliberately left for a later decision.
+6. **Rejected for now:** forcing `policy=step_wise` via udev (userspace, not a
    kernel fix), and teaching `thermal_of` to parse a `governor` DT property
    (correct in general, largest blast radius).
 
 ## Remaining boards
 
-These lists were built for the power_allocator theory. Reread them with the
-correction above in mind: on a step_wise system the cooling-map boards are
-**not** broken, they simply inherit the `gov_step_wise.c` hysteresis fix for
-free, with no DT change needed. Only boards that genuinely default to
-power_allocator have the "fan pinned at max" problem — check each target's
-`policy` before assuming either way.
+All of these are step_wise on Armbian vendor — same config file, same default
+(see the governor section). So the cooling-map boards are not broken; they
+simply inherit the `gov_step_wise.c` hysteresis fix for free, with no DT change
+needed.
 
 Cooling-map boards (get the step_wise fix automatically; no DT work):
 
@@ -288,12 +403,12 @@ poll all the way to maximum once that trip is crossed, rather than tracking
 temperature proportionally. Functional, but crude — the 5B's explicit per-trip
 `<&fan0 N N+1>` ladder is the better pattern.
 
-Still-audible PWM carriers found in the earlier sweep, unfixed:
+Still-audible PWM carriers, unfixed (counts re-verified, see the sweep table):
 
 - 16.667 kHz (60000 ns): `rk3576-rock-4d.dts`, `rk3576-radxa-cm4-io.dts`,
   `rk3576-recomputer-rk3576-devkit.dts`
 - 4 kHz (250000 ns): `rk3588-blade3-v101-linux.dts`, `rk3588s-lubancat-4.dts`
 - **50 Hz** (20000000 ns): `rk3588-orangepi-5-ultra.dts`,
   `rk3566-orangepi-3b-v2.1.dts` — audible flutter, worst in the tree
-- ~40 boards sit at 20 kHz (50000 ns). Right at the edge of audibility and the
+- 43 boards sit at 20 kHz (50000 ns). Right at the edge of audibility and the
   de-facto convention in this tree; deliberately left alone.
