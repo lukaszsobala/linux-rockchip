@@ -95,9 +95,30 @@ static void update_passive_instance(struct thermal_zone_device *tz,
 		tz->passive += value;
 }
 
+/**
+ * thermal_trip_is_engaged() - is any instance of @trip currently throttling?
+ * @tz:		thermal zone to operate on
+ * @trip:	trip point number
+ *
+ * A trip point is considered engaged once the governor has given at least one
+ * of its instances a target state.  This is the latch that lets the hysteresis
+ * band below the trip temperature be applied only on the way down.
+ */
+static bool thermal_trip_is_engaged(struct thermal_zone_device *tz, int trip)
+{
+	struct thermal_instance *instance;
+
+	list_for_each_entry(instance, &tz->thermal_instances, tz_node)
+		if (instance->trip == trip && instance->initialized &&
+		    instance->target != THERMAL_NO_TARGET)
+			return true;
+
+	return false;
+}
+
 static void thermal_zone_trip_update(struct thermal_zone_device *tz, int trip)
 {
-	int trip_temp;
+	int trip_temp, hyst = 0;
 	enum thermal_trip_type trip_type;
 	enum thermal_trend trend;
 	struct thermal_instance *instance;
@@ -106,12 +127,24 @@ static void thermal_zone_trip_update(struct thermal_zone_device *tz, int trip)
 
 	tz->ops->get_trip_temp(tz, trip, &trip_temp);
 	tz->ops->get_trip_type(tz, trip, &trip_type);
+	if (tz->ops->get_trip_hyst)
+		tz->ops->get_trip_hyst(tz, trip, &hyst);
 
 	trend = get_tz_trend(tz, trip);
 
 	if (tz->temperature >= trip_temp) {
 		throttle = true;
 		trace_thermal_zone_trip(tz, trip, trip_type);
+	} else if (hyst && tz->temperature > trip_temp - hyst &&
+		   thermal_trip_is_engaged(tz, trip)) {
+		/*
+		 * The temperature has dropped below the trip point but is
+		 * still inside its hysteresis band, and the trip is already
+		 * engaged.  Keep throttling so that the cooling state is only
+		 * stepped back down once the zone has genuinely cooled, rather
+		 * than chattering every time the temperature grazes the trip.
+		 */
+		throttle = true;
 	}
 
 	dev_dbg(&tz->device, "Trip%d[type=%d,temp=%d]:trend=%d,throttle=%d\n",
