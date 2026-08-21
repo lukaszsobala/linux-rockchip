@@ -26,11 +26,36 @@
 
 	/delete-node/ chosen;
 
+	/*
+	 * The fan is driven by the pwm-fan driver's own trip table rather
+	 * than by thermal-zone cooling-maps.  On this platform the cooling-map
+	 * route never actuates the fan: soc_thermal runs the power_allocator
+	 * governor, which only touches cooling devices implementing the
+	 * power-actor ops (get_requested_power/state2power/power2state), and
+	 * pwm-fan implements none of them.  rockchip,temp-trips instead makes
+	 * pwm_fan_probe() register a rockchip-system-monitor notifier and set
+	 * the PWM directly, bypassing the thermal governor entirely.
+	 * See FAN-CONTROL-NOTES.md in the tree root for the full analysis.
+	 *
+	 * cooling-levels must stay: pwm_fan_of_get_cooling_data() parses it
+	 * into the state -> duty table that the temp-trips states index into.
+	 * State 0 is off; states 1-8 are the nine-level ladder.
+	 */
 	fan0: pwm-fan {
 		compatible = "pwm-fan";
 		#cooling-cells = <2>;
 		cooling-levels = <0 128 146 164 182 201 219 237 255>;
 		pwms = <&pwm1 0 25000 0>;
+		rockchip,temp-trips = <
+			45000	1
+			50000	2
+			55000	3
+			60000	4
+			65000	5
+			70000	6
+			75000	7
+			80000	8
+		>;
 	};
 
 	vcc12v_dcin: vcc12v-dcin {
@@ -521,94 +546,16 @@
 	status = "okay";
 };
 
-&soc_thermal {
-	polling-delay = <1000>;
-	polling-delay-passive = <2000>;
-	trips {
-		trip0: trip-point@0 {
-			temperature = <45000>;
-			hysteresis = <5000>;
-			type = "active";
-		};
-		trip1: trip-point@1 {
-			temperature = <50000>;
-			hysteresis = <5000>;
-			type = "active";
-		};
-		trip2: trip-point@2 {
-			temperature = <55000>;
-			hysteresis = <5000>;
-			type = "active";
-		};
-		trip3: trip-point@3 {
-			temperature = <60000>;
-			hysteresis = <5000>;
-			type = "active";
-		};
-		trip4: trip-point@4 {
-			temperature = <65000>;
-			hysteresis = <5000>;
-			type = "active";
-		};
-		trip5: trip-point@5 {
-			temperature = <70000>;
-			hysteresis = <5000>;
-			type = "active";
-		};
-		trip6: trip-point@6 {
-			temperature = <75000>;
-			hysteresis = <5000>;
-			type = "active";
-		};
-		pcritical: trip-point@7 {
-			temperature = <80000>;
-			hysteresis = <1000>;
-			type = "active";
-		};
-	};
-	cooling-maps {
-		map0 {
-			trip = <&trip0>;
-			cooling-device = <&fan0 0 1>;
-			contribution = <1024>;
-		};
-		map1 {
-			trip = <&trip1>;
-			cooling-device = <&fan0 1 2>;
-			contribution = <1024>;
-		};
-		map2 {
-			trip = <&trip2>;
-			cooling-device = <&fan0 2 3>;
-			contribution = <1024>;
-		};
-		map3 {
-			trip = <&trip3>;
-			cooling-device = <&fan0 3 4>;
-			contribution = <1024>;
-		};
-		map4 {
-			trip = <&trip4>;
-			cooling-device = <&fan0 4 5>;
-			contribution = <1024>;
-		};
-		map5 {
-			trip = <&trip5>;
-			cooling-device = <&fan0 5 6>;
-			contribution = <1024>;
-		};
-		map6 {
-			trip = <&trip6>;
-			cooling-device = <&fan0 6 7>;
-			contribution = <1024>;
-		};
-		map7 {
-			trip = <&pcritical>;
-			cooling-device = <&fan0 7 8>;
-			contribution = <1024>;
-		};
-	};
-};
+/*
+ * The &soc_thermal override that used to live here defined eight active trip
+ * points (45-80 C) and eight cooling-maps binding them to fan0.  All of it was
+ * dead code: power_allocator ignores non-power-actor cooling devices, so the
+ * maps never moved the fan.  Fan control now lives in the pwm-fan node above.
+ *
+ * It also set polling-delay-passive = <2000>, overriding the SoC default of
+ * 20 ms and slowing CPU/GPU passive throttling for no reason once the fan is
+ * no longer driven from here.  Dropping the override restores the default.
+ */
 
 &uart6 {
 	pinctrl-names = "default";
