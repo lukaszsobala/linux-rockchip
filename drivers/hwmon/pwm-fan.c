@@ -519,13 +519,33 @@ static int pwm_fan_get_thermal_trips(struct device *dev, char *porp_name,
 	return 0;
 }
 
+/*
+ * The rockchip,temp-trips table carries a temperature and a fan state per
+ * entry but no hysteresis of its own, so apply a fixed one here.  Trips in
+ * that table are typically spaced 5 to 6 degrees apart, and without any
+ * hysteresis the fan changes state on every sample that grazes a trip,
+ * which is audible as constant speed hunting.
+ */
+#define PWM_FAN_TEMP_HYST	2000	/* millicelsius */
+
 static int pwm_fan_temp_to_state(struct pwm_fan_ctx *ctx, int temp)
 {
 	struct thermal_trips *trips = ctx->thermal_trips;
 	int i, state = 0;
 
 	for (i = 0; trips[i].state != INT_MAX; i++) {
-		if (temp >= trips[i].temp)
+		int trip_temp = trips[i].temp;
+
+		/*
+		 * Only trips at or below the state we currently occupy get the
+		 * hysteresis band, so the fan speeds up as soon as a trip is
+		 * reached but does not slow down again until the temperature
+		 * has fallen a band below the trip that selected the state.
+		 */
+		if (trips[i].state <= ctx->pwm_fan_state)
+			trip_temp -= PWM_FAN_TEMP_HYST;
+
+		if (temp >= trip_temp)
 			state = trips[i].state;
 	}
 
